@@ -1,0 +1,7 @@
+.idea/
+**/__pycache__
+**/*.pyc
+**/*.png
+venv
+visualisations/
+.DS_Store
