@@ -1,0 +1,326 @@
+---
+title: "sml ass. 2"
+author: "Liam Heylin"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+'The goal is to build a supervised learning model that can predict whether the winner of the majority for a county will
+be biden or trump, using the available numerical features that record previous election results and that summarize
+economic, demographic, and social aspects of a county'
+
+To achieve this goal, I will train 3 supervised models: Logistic regression, Support vector machine and random forest. First we load in the necessary libraries.
+```{r setup, include=FALSE}
+library(car)
+library(caret)
+library(ROCR)
+library(caret)
+library(doParallel)
+
+load("/Users/liamheylin/downloads/data_assignment_2.RData")
+```
+
+## Inspect data
+```{r}
+table(elections$winner)/sum(table(elections$winner))
+```
+The winner variable is quite imbalanced, with the 'trump' class representing roughly 80% of the data and the other 20% being 'biden. The area under the ROC curve (AUC-ROC) is robust to class imbalance and provides a good measure of how well the model can distinguish between the two classes. I will use this metric to maximize the cross-validation models. I will also use 5 as the number of folds for each model as this roughly represents the distribution of the classes to ensure that in each fold each class is represented fairly.
+
+## Preprocess the data
+```{r, results = "hide", message=FALSE,  warning=FALSE, fig.width=10, fig.height=5}
+
+# Preprocess the data
+
+elections_df <- elections[, !(names(elections) %in% c("state", "county"))]
+elections_df$winner <- factor(elections_df$winner) # convert to factor
+
+
+# 80% training/val and 20% test
+set.seed(42)  # for reproducibility
+train_val_index <- createDataPartition(elections_df$winner, p = 0.80, list = FALSE)
+data_train_val <- elections_df[train_val_index, ]
+data_test <- elections_df[-train_val_index, ]
+
+# Standardise data_train_val and data_test spearately to prevent data leakage
+pre_scale_train_val <- preProcess(data_train_val, method = c("center", "scale"))
+data_train_val <- predict(pre_scale_train_val, data_train_val)
+
+pre_scale_test <- preProcess(data_test, method = c("center", "scale"))
+data_test <- predict(pre_scale_test, data_test)
+
+```
+
+I will define train control as the same for all models to ensure all models are trained/evaluated under same scenarios. summaryFucntion set to twoClassSummary so ROC, Sensitivity and Specificity are calculated for each fold.
+```{r}
+train_ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 5,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE
+)
+```
+
+
+## Logistic regression model
+
+The data contains 27 potential predictor variables. In order to minimise the effects of potential overfitting and multicolinearity, the method I chose for training my logistic regression model is the glmStepAIC which iteratively performs stepwise model selection by adding or removing one predictor variable at a time and recalculating the AIC for each model until adding/subtracting any more variables does not reduc the AIC any further.
+```{r, warning=FALSE, results = "hide"}
+
+
+
+levels(data_train_val$winner) <- make.names(levels(data_train_val$winner))
+fit_lr3 <- train(winner ~ ., data = data_train_val,
+                 method = "glmStepAIC",
+                 family = "binomial",
+                 metric = "ROC",
+                 direction = "backward",
+                 trControl = train_ctrl)
+
+
+
+```
+
+```{r}
+
+
+
+# inspect PR curve and determine best value of Tau 
+
+par(mfrow = c(1, 1))
+model <- fit_lr3$finalModel
+pred_obj <- prediction(fitted(model), data_train_val$winner)
+
+perf_f <- performance(pred_obj, "f")
+tau <- perf_f@x.values[[1]]
+f <- perf_f@y.values[[1]]
+best_pr <- which.max(f)
+plot(tau, f, type = "l")
+points(tau[best_pr], f[best_pr], pch = 19, col = adjustcolor("darkorange2", 0.5))
+best_tau <- tau[best_pr] # optimal tau according to the PR curve
+cat("Best Tau:", best_tau)
+
+
+# Check other components as well
+summary(fit_lr3$finalModel)
+vif(fit_lr3$finalModel)
+fit_lr3$resample
+
+```
+Upon inspection of the final model, we can see that the highest performing model used 9 variables and that the variance inflation factor for each of these variables is below 10 which is commonly used as the threshold for an acceptable score. The summary of the model shows us that 'trump_2016', 'white_2019' and the intercept were the most significant variables in the model. The intercept being very significant shows us that there is bias towards each prediction being trump which is likely due to the class imbalance of our target variable. There were also several warnings of complete separation which is likely due to the majority of voters who voted for trump in 2016 voting for him again.
+
+
+## Support vector machine
+
+The method I chose for my support vector machine was the svmRadial as RBF kernels are known for their robustness across different types of datasets. They are less sensitive to noise and outliers in comparison to other kernels. The RBF kernel is effective for handling non-linearly separable data which may prove valuable in handling a data set with 27 potential predictors. I expanded the tune grid drom 10 to 300 for C as after several runs, there was higher ROC values achieved at higher levels of C.
+```{r, warning=FALSE}
+
+tune_grid <- expand.grid(C = c(10, 50, 100, 200, 300),
+                         sigma = c(0.001, 0.005, 0.01, 0.05, 0.1))
+
+fit_svm_grbf <- train(winner ~ ., data = data_train_val,
+                      method = "svmRadial",
+                      metric = 'ROC',
+                      trControl = train_ctrl,
+                      tuneGrid = tune_grid)
+
+par(mfrow = c(1, 1))
+plot(fit_svm_grbf)
+fit_svm_grbf$resample
+
+```
+The highest values for ROC were achieved when sigma was nearly 0 and the Cost parameter was around 200-300 as is shown by the plot above.
+
+
+
+## Random Forest
+
+Random Forest models come with a useful feature importance measure, which tells us how much each feature contributes to the model's performance. This is great for figuring out which predictors are the most important, and it can help us select the best features for our model. They are also robust to outliers and noisy data due to their ensemble nature. A huge pitfall for this model however is its computational intensity. The model below uses grid search which is an exhaustive method which maximises perfomance given a set of potential parameters.
+```{r, warning=FALSE}
+
+# This is to speed up computation
+cl <- makeCluster(detectCores() - 2) # keep 2 cores free
+registerDoParallel(cl)
+
+
+# set grids of hyperparameters
+ntree_set <- c(100, 200, 500, 1000)
+grid <- expand.grid( mtry = 2:(ncol(data_train_val)-1) )
+
+# run tuning procedure
+out <- vector("list", length(ntree_set))
+levels(data_train_val$winner) <- make.names(levels(data_train_val$winner))
+for ( j in 1:length(ntree_set) ) {
+  set.seed(3344)
+  out[[j]] <- train(winner ~ .,
+                    trControl = train_ctrl,
+                    data = data_train_val,
+                    method = "rf",
+                    metric = "ROC",
+                    tuneGrid = grid,
+                    ntree = ntree_set[j])
+}
+stopCluster(cl)
+
+
+
+
+
+
+# extract selected `mtry`
+lapply(out, "[[", "bestTune")
+roc <- sapply(out, "[[", c("results", "ROC"))
+colnames(roc) <- ntree_set
+roc <- cbind(grid, roc)
+head(roc)
+# plot curves
+par(mfrow = c(1,1))
+{
+  colors <- c("purple2", "forestgreen", "darkorange3", "deepskyblue3")
+  matplot(roc$mtry, roc[,-1], type = "l", lwd = 2, lty = 1,
+          col = colors)
+  grid()
+  legend("topright", legend = ntree_set, fill = colors, bty = "n")
+}
+names(out) <- paste0("ntree_", ntree_set)
+res <- resamples(out)
+summary(res)
+
+best_model <- out[["ntree_1000"]]
+
+
+```
+Based on the output of lapply(out, "[[", "bestTune") and upon inspection of the plot, the best performing model with respect to ROC is "ntree_1000" with mtry = 4.
+
+
+## Plot all metrics from cross validation
+```{r}
+#Plot all metrics from cross validation
+
+par(mfrow = c(1,3))
+{
+roc_lr <- fit_lr3$resample$ROC
+roc_svm <- fit_svm_grbf$resample$ROC
+roc_rf <- best_model$resample$ROC
+
+
+
+# single data frame
+roc_data <- data.frame(
+  Model = c(rep("Logistic Regression", length(roc_lr)),
+            rep("SVM", length(roc_svm)),
+            rep("Best Model", length(roc_rf))),
+  ROC = c(roc_lr, roc_svm, roc_rf)
+)
+
+
+# boxplot to show all results in a single panel
+cols <- c("darkorange3", "deepskyblue3", "magenta3")
+model_names <- c("Logistic Regression", "SVM", "Random Forest")
+
+boxplot(ROC ~ Model, data = roc_data,
+        border = cols, col = adjustcolor(cols, 0.1), xaxt = "n",
+        main = 'ROC by model')
+
+legend("bottomleft", legend = model_names, bty = "n", fill = cols)
+}
+
+
+{
+  roc_lr <- fit_lr3$resample$Sens
+  roc_svm <- fit_svm_grbf$resample$Sens
+  roc_rf <- best_model$resample$Sens
+  
+  
+  
+  # single data frame
+  roc_data <- data.frame(
+    Model = c(rep("Logistic Regression", length(roc_lr)),
+              rep("SVM", length(roc_svm)),
+              rep("Best Model", length(roc_rf))),
+    ROC = c(roc_lr, roc_svm, roc_rf)
+  )
+  
+  
+  # boxplot to show all results in a single panel
+  cols <- c("darkorange3", "deepskyblue3", "magenta3")
+  model_names <- c("Logistic Regression", "SVM", "Random Forest")
+  
+  boxplot(ROC ~ Model, data = roc_data,
+          border = cols, col = adjustcolor(cols, 0.1), xaxt = "n",
+          main = 'Sensitivity by model')
+  
+  legend("bottomleft", legend = model_names, bty = "n", fill = cols)
+}
+
+
+
+{
+  roc_lr <- fit_lr3$resample$Spec
+  roc_svm <- fit_svm_grbf$resample$Spec
+  roc_rf <- best_model$resample$Spec
+  
+  
+  
+  # single data frame
+  roc_data <- data.frame(
+    Model = c(rep("Logistic Regression", length(roc_lr)),
+              rep("SVM", length(roc_svm)),
+              rep("Best Model", length(roc_rf))),
+    ROC = c(roc_lr, roc_svm, roc_rf)
+  )
+  
+  
+  # boxplot to show all results in a single panel
+  cols <- c("darkorange3", "deepskyblue3", "magenta3")
+  model_names <- c("Logistic Regression", "SVM", "Random Forest")
+  
+  boxplot(ROC ~ Model, data = roc_data,
+          border = cols, col = adjustcolor(cols, 0.1), xaxt = "n",
+          main = 'Specificity by model')
+  
+  legend("bottomleft", legend = model_names, bty = "n", fill = cols)
+}
+
+
+```
+
+Upon inspection of the plots of the distributions of various metrics calculated from each fold for each model, it's clear that in fact all of the models ar performing very well and do not differ greatly with AUC-ROC of around 0.998, Sensitivity around 0.95 and Specificity of around 0.99. All models have very similar means when it comes to AUC-ROC, Sensitivity and Specificity, however the SVM model consistently has the lowest variance in terms of these metrics across the folds and the random forest with the highest variance in each metric. The SVM model also marginally outperforms the other models in AUC-ROC with a mean of aound 0.9985 which is the metric that each of the models was maximised with respect to. As a result of these findings, I conclude that the best model of choice is the SVM model usig the svmRadial method.
+
+
+
+# Assess general predictive performance of best model
+
+I decided to assign 'biden' as the positive class as it is the rarer class and the statistics may be more indicative of model performance.
+```{r}
+
+y_pred <- predict(fit_svm_grbf, newdata = data_test)
+# compute metrics
+confusionMatrix(y_pred, data_test$winner, positive = "biden")
+
+
+```
+
+
+Accuracy: Proportion of correct predictions made by the model. The model correctly predicts 98% of the cases. Originally this metric looks very impressive.
+
+No Information Rate (NIR): NIR is the accuracy achieved by always predicting the majority class. 0.8353 would be the accuracy if we always predicted the majority class ('trump'). This indicate that accuracy would be a falwed metric to have used for the maximisation of the models.
+
+Cohen's Kappa: Cohen's Kappa measures the agreement between the model's predictions and the actual classes, considering agreement occurring by chance. Kappa value of 0.9256 shows my model has a high level of agreement beyond what would be expected by chance.
+
+Specificity: How well the model identifies positive cases ('trump'). My model correctly identifies 99.40% of the 'trump' instances.
+
+Sensitivity: How well my model identifies negative cases. The model correctly identifies 90.91% of the 'biden' instances.
+
+Positive Predictive Value (PPV): Proportion of correctly identified positive cases among all cases the model classified as positive. Of all cases the model predicted as 'biden', 96.77% were correct.
+
+
+Negative Predictive Value (NPV): NPV indicates the proportion of correctly identified negative cases among all cases our model classified as negative. Of all cases the model predicted as 'trump', 98.23% were correct.
+
+Detection Prevalence: This is the proportion of cases our model identified as positive among all cases. Approximately 15.47% of all cases the model identified are 'biden'.
+
+Balanced Accuracy: A view of our model's overall performance, considering both sensitivity and specificity. With a balanced accuracy of 0.9516, our model performs well in classifying both 'trump' and 'biden' instances.
+
+Based on the confusion matrix and statistics, the final SVM model has high general predictive performance. However it needs to be noted that some of the predictor variables were highly correlated with the target variable for example trump_2016 which led to perfect prediction for a lot of the cases. The data was quite imbalanced with there being very few instances of 'biden' which had the potential to inflate the results of the models however the methods chosen were quite robust and the resultant metrics show that the model does indeed have a very good ability of predicting if the winner will be Biden or Trump.
+
